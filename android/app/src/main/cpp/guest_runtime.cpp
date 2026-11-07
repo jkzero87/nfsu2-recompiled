@@ -28,6 +28,7 @@
 #include <ctime>
 #include <thread>
 #include <atomic>
+#include <cstdio>
 #include <unistd.h>
 #include <pthread.h>
 #include <filesystem>
@@ -186,6 +187,14 @@ struct WaitScope {
     WaitScope(const char* what,uint32_t handle){auto& trace=currentTrace();trace.wait=what;trace.handle=handle;}
     ~WaitScope(){currentTrace().wait=nullptr;}
 };
+// Fusion Fix (ThirteenAG, NFSUnderground2.FusionFix Misc.ixx) serializes the
+// "bf:" file device (bfOpen 0x6f69e6, bfClose 0x6f69b2) and the bWare
+// allocator (bWareMalloc 0x440390, bFree 0x440540): the game changes their
+// lists without a lock, and time-slice handovers can fall inside them here.
+// Index 0 is the file device, 1 the allocator. Read and written under the
+// machine lock; the stall watch reads the counters without it.
+struct GuestFunctionLock { uint32_t owner{0}; unsigned depth{0}; std::atomic<uint64_t> entries{0},contended{0}; };
+GuestFunctionLock fusionLocks[2];
 std::atomic<int64_t> lastPresentMs{0};
 int64_t steadyMs(){return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 void startStallWatch(){
@@ -195,9 +204,15 @@ void startStallWatch(){
         while(!stopRequested.load()){
             std::this_thread::sleep_for(std::chrono::seconds(2));
             int64_t last=lastPresentMs.load(),idle=steadyMs()-last;
-            if(guestPaused.load()||idle<12000||reportedFor==last)continue;
-            reportedFor=last;
-            NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Guest stall: no frame for %lld s; guest threads:",static_cast<long long>(idle/1000));
+            // A load can hang while frames keep presenting: creating this
+            // file in the game folder requests the same thread dump.
+            bool requested=std::remove((hostGameRoot+"/nfsdiag_dump").c_str())==0;
+            if(!requested&&(guestPaused.load()||idle<12000||reportedFor==last))continue;
+            if(!requested)reportedFor=last;
+            NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Guest %s: no frame for %lld s; fusion locks bf %llu/%llu, memory %llu/%llu (contended/entries); guest threads:",
+                requested?"dump":"stall",static_cast<long long>(idle/1000),
+                static_cast<unsigned long long>(fusionLocks[0].contended.load()),static_cast<unsigned long long>(fusionLocks[0].entries.load()),
+                static_cast<unsigned long long>(fusionLocks[1].contended.load()),static_cast<unsigned long long>(fusionLocks[1].entries.load()));
             std::lock_guard<std::mutex> lock(threadTracesMutex);
             for(auto& [id,trace]:threadTraces){
                 const char* wait=trace->wait.load();uint32_t handle=trace->handle.load();
@@ -249,7 +264,11 @@ void checkGuestProgress() {
     if((++checkpoints&63u)==0){
         auto now=std::chrono::steady_clock::now();
         if(now>bootDeadline)throw GuestStop("CRT bring-up time budget reached at "+hex(g_cur_func));
-        auto slice=renderThread?std::chrono::microseconds(3000):std::chrono::microseconds(500);
+        // Diag build: 15 ms for every thread, about a Windows quantum. The game
+        // changes shared lists between imports without locks; 0.5-3 ms slices
+        // preempted it inside them far more often than Windows does. A thread
+        // that polls the clock hands over sooner (performanceCounter).
+        auto slice=std::chrono::milliseconds(15);
         if(now-machine.acquired>=slice&&machine.hasWaiters()){
             yieldGuestMachine();
             if(renderThread){++renderYields;renderWait+=std::chrono::steady_clock::now()-now;}
@@ -761,6 +780,25 @@ struct DispatchHash {
         return nullptr;
     }
 };
+}
+// Entered by the wrappers that scripts/wrap_fusion_locks.py puts in front of
+// the four lifted bodies; recursive per guest thread, like a critical section.
+// A waiter hands the machine over until the owner leaves.
+extern "C" void nfs_fusion_lock(int which) {
+    auto& lock=fusionLocks[which];
+    ++lock.entries;
+    if(lock.depth&&lock.owner!=guestThreadId){
+        uint64_t count=++lock.contended;
+        if(count<=20)NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Fusion lock %s contended (%llu): thread %u waits for thread %u",
+            which?"memory":"bf",static_cast<unsigned long long>(count),guestThreadId,lock.owner);
+        WaitScope scope(which?"FusionLock(memory)":"FusionLock(bf)",lock.owner);
+        while(lock.depth)yieldGuestMachine();
+    }
+    lock.owner=guestThreadId;++lock.depth;
+}
+extern "C" void nfs_fusion_unlock(int which) {
+    auto& lock=fusionLocks[which];
+    if(lock.depth&&--lock.depth==0)lock.owner=0;
 }
 extern "C" recomp_func_t recomp_lookup(uint32_t va) {
     // Sound/input/D3D COM and import stubs resolve in recomp_lookup_import.

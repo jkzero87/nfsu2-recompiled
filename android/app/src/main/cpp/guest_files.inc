@@ -18,6 +18,9 @@ std::filesystem::path gamePath(std::string guest){
     auto check=resolved.lexically_relative(root);for(const auto& part:check)if(part=="..")throw GuestStop("Guest symlink leaves data root");return resolved;
 }
 std::map<uint32_t,int> fileHandles;uint32_t nextFileHandle=0xf0060000;
+// Diag build: game-relative path per open handle; reads and closes of car files are logged.
+std::map<uint32_t,std::string> filePaths;
+bool tracedFile(uint32_t handle){auto path=filePaths.find(handle);return path!=filePaths.end()&&lower(path->second).rfind("cars/",0)==0;}
 // The game skips its CD-drive check when the game folder holds a file named
 // "foobar" (its developer switch, 0x0057CAC0("foobar")). Copies made without
 // it showed the insert-disc MessageBoxA. Present it as an empty file when absent.
@@ -26,7 +29,7 @@ bool discCheckSwitch(const std::filesystem::path& path){
     return lower(path.filename().string())=="foobar"&&!std::filesystem::exists(path,error)&&
         std::filesystem::weakly_canonical(path.parent_path())==std::filesystem::weakly_canonical(hostGameRoot);
 }
-bool closeGuestFile(uint32_t handle){auto file=fileHandles.find(handle);if(file==fileHandles.end())return false;::close(file->second);fileHandles.erase(file);return true;}
+bool closeGuestFile(uint32_t handle){auto file=fileHandles.find(handle);if(file==fileHandles.end())return false;if(tracedFile(handle))NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest close %08x %s",handle,filePaths[handle].c_str());filePaths.erase(handle);::close(file->second);fileHandles.erase(file);return true;}
 void fileType(){
     uint32_t handle=arg(0);
     if(handle>=0xf0000200u&&handle<=0xf0000208u){ret(2,1);return;}
@@ -46,8 +49,10 @@ void createFile(){
     switch(disposition){case 1:options|=O_CREAT|O_EXCL;break;case 2:options|=O_CREAT|O_TRUNC;break;case 3:break;case 4:options|=O_CREAT;break;case 5:options|=O_TRUNC;break;default:lastError=87;ret(UINT32_MAX,7);return;}
     bool existed=std::filesystem::exists(path);
     int descriptor=disposition==3&&!(access&0x40000000u)&&discCheckSwitch(path) ? ::open("/dev/null",O_RDONLY|O_CLOEXEC) : ::open(path.c_str(),options|O_CLOEXEC,0600);
-    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest file %s access=%x disposition=%u",path.filename().string().c_str(),access,disposition);
-    if(descriptor<0){lastError=fileError();ret(UINT32_MAX,7);return;}uint32_t handle=nextFileHandle++;fileHandles.emplace(handle,descriptor);lastError=(disposition==2||disposition==4)&&existed?183:0;ret(handle,7);
+    int openError=descriptor<0?errno:0;
+    auto relative=path.lexically_relative(std::filesystem::weakly_canonical(hostGameRoot)).string();
+    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest file %s access=%x disposition=%u handle=%08x errno=%d",relative.c_str(),access,disposition,descriptor<0?0u:nextFileHandle,openError);
+    if(descriptor<0){errno=openError;lastError=fileError();ret(UINT32_MAX,7);return;}uint32_t handle=nextFileHandle++;fileHandles.emplace(handle,descriptor);filePaths[handle]=relative;lastError=(disposition==2||disposition==4)&&existed?183:0;ret(handle,7);
 }
 void readFile(){
     auto file=fileHandles.find(arg(0));if(file==fileHandles.end()){lastError=6;ret(0,5);return;}if(arg(4))throw GuestStop("Overlapped ReadFile pending");
@@ -56,6 +61,7 @@ void readFile(){
     // rest of its buffer as loaded data (chunk walks and string reads off the end of
     // guest memory a few seconds after start or while streaming the world).
     if(arg(3))write32(arg(3),0);
+    off_t start=tracedFile(arg(0))?::lseek(file->second,0,SEEK_CUR):-1;
     auto* target=static_cast<uint8_t*>(ptr(arg(1),arg(2)));uint32_t total=0;
     while(total<arg(2)){
         ssize_t count=::read(file->second,target+total,arg(2)-total);
@@ -63,6 +69,7 @@ void readFile(){
         if(!count)break;
         total+=uint32_t(count);
     }
+    if(start>=0)NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest read %08x %s at %lld: %u of %u bytes into %08x",arg(0),filePaths[arg(0)].c_str(),static_cast<long long>(start),total,arg(2),arg(1));
     if(arg(3))write32(arg(3),total);ret(1,5);
 }
 void writeFile(){

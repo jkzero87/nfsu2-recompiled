@@ -28,7 +28,7 @@ final class GameOptions {
                     new String[] {"100", "75", "50", "720"},
                     new String[] {"Nativa · máxima calidad", "75% · equilibrada", "50% · máximo rendimiento",
                             "1280×720 · 16:9"}),
-            new Option(FPS, "Límite de FPS", "120",
+            new Option(FPS, "Límite de FPS", "60",
                     new String[] {"30", "60", "90", "120", "0"},
                     new String[] {"30 FPS · ahorra batería", "60 FPS", "90 FPS", "120 FPS", "Sin límite"}),
             new Option(WIDESCREEN, "Pantalla panorámica", "on",
